@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "engines": {
-    "node": "18.x"
+    "node": ">=18"
   },
   "scripts": {
     "start": "node server.js",
@@ -11,7 +11,8 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "multer": "^1.4.4",
-    "sharp": "^0.32.1"
+    "multer": "^1.4.4-lts.1",
+    "sharp": "^0.33.0",
+    "zxing-wasm": "^2.2.4"
   }
 }

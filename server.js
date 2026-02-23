@@ -6,49 +6,147 @@ const sharp = require('sharp');
 const app = express();
 const port = process.env.PORT || 8080;
 
-// API: /api/scan - accept an image file and attempt DataMatrix (ECC200) decoding
-const upload = multer({ storage: multer.memoryStorage() });
+// ── Multer: keep uploaded images in memory; limit to 20 MB ───────────────────
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
-// Try to load an optional native libdmtx binding for Node (if installed)
+// ── Optional native libdmtx binding ─────────────────────────────────────────
 let nodeLibDmtx = null;
 try {
-  // try common package names; keep optional
   nodeLibDmtx = require('node-libdmtx');
 } catch (e1) {
   try { nodeLibDmtx = require('libdmtx'); } catch (e2) { nodeLibDmtx = null; }
 }
 
-app.post('/api/scan', upload.single('image'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'no image uploaded' });
-  try {
-    // Normalize image to RGBA raw buffer for decoder bindings that expect raw pixels
-    const img = sharp(req.file.buffer).ensureAlpha().raw();
-    const { data, info } = await img.toBuffer({ resolveWithObject: true });
+// ── ZXing WASM initialisation ───────────────────────────────────────────────────
+// zxing-wasm ships a CJS build; require once and reuse.
+// prepareZXingModule warms up the WASM binary at startup (non-blocking).
+const { readBarcodes, prepareZXingModule } = require('zxing-wasm/reader');
+prepareZXingModule(); // fire-and-forget warm-up; decode calls await internally
 
-    // If a native libdmtx binding is available, use it
+// ── Preprocessing pipeline tuned for small industrial ECC 200 codes ──────────
+/**
+ * Accepts raw image buffer (any format Sharp understands).
+ * Returns a PNG buffer ready for ZXing WASM or libdmtx.
+ *
+ * Steps:
+ *  1. Convert to grayscale          — removes chromatic noise irrelevant to 2-D codes
+ *  2. Upscale 2× if width < 1200px  — adds sub-pixel detail for tiny module grids
+ *  3. Normalize contrast            — equalises histogram; helps dark/light backgrounds
+ *  4. Mild Gaussian blur (σ=0.4)    — smooths JPEG/camera artefacts around module edges
+ */
+async function preprocessImage(inputBuffer) {
+  const meta = await sharp(inputBuffer).metadata();
+
+  let pipeline = sharp(inputBuffer)
+    // Step 1: grayscale
+    .grayscale();
+
+  // Step 2: upscale if needed (Lanczos preserves edge sharpness better than nearest-neighbour)
+  if (meta.width && meta.width < 1200) {
+    pipeline = pipeline.resize(meta.width * 2, null, {
+      kernel: sharp.kernel.lanczos3,
+      withoutEnlargement: false,
+    });
+  }
+
+  // Step 3: stretch contrast to full 0-255 range
+  pipeline = pipeline.normalize();
+
+  // Step 4: gentle blur to reduce digitisation noise (does not destroy module edges at σ=0.4)
+  pipeline = pipeline.blur(0.4);
+
+  // Output PNG — lossless, avoids JPEG re-compression artefacts for downstream decoders
+  return pipeline.png().toBuffer();
+}
+
+// ── /api/scan ────────────────────────────────────────────────────────────────
+/**
+ * POST /api/scan
+ * Body: multipart/form-data with field "image" (any image format).
+ * Response: { ok: boolean, results: Array<{ text, format, points? }> }
+ *
+ * Decode order:
+ *   1. ZXing WASM (preprocessed PNG) — best tolerance for ECC 200
+ *   2. libdmtx native binding        — if installed; raw RGBA fallback
+ */
+app.post('/api/scan', upload.single('image'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'no image uploaded' });
+
+  try {
+    // Preprocess once; reuse buffer for both decoders
+    const preprocessed = await preprocessImage(req.file.buffer);
+
+    // ── 1. ZXing WASM on preprocessed PNG ─────────────────────────────────────────
+    try {
+      // Wrap PNG buffer in a Blob — Blob is available natively in Node ≥18
+      const blob = new Blob([preprocessed], { type: 'image/png' });
+
+      const zxResults = await readBarcodes(blob, {
+        formats: ['DataMatrix'],
+        tryHarder: true,    // optimize for accuracy over speed
+        tryRotate: true,    // handle rotated codes (common in industrial settings)
+        tryInvert: true,    // handle inverted (white-on-black) codes
+        tryDenoise: true,   // morphological closing filter for 2-D codes (experimental)
+      });
+
+      const valid = zxResults.filter(r => r.isValid);
+      if (valid.length > 0) {
+        return res.json({
+          ok: true,
+          results: valid.map(r => ({
+            text: r.text,
+            format: 'DataMatrix',
+            points: r.position
+              ? [
+                  { x: r.position.topLeft.x,     y: r.position.topLeft.y },
+                  { x: r.position.topRight.x,    y: r.position.topRight.y },
+                  { x: r.position.bottomRight.x, y: r.position.bottomRight.y },
+                  { x: r.position.bottomLeft.x,  y: r.position.bottomLeft.y },
+                ]
+              : undefined,
+          })),
+        });
+      }
+    } catch (zxErr) {
+      console.warn('[scan] ZXing WASM error:', zxErr.message ?? zxErr);
+    }
+
+    // ── 2. libdmtx native binding (optional) ─────────────────────────────────
     if (nodeLibDmtx && typeof nodeLibDmtx.decode === 'function') {
       try {
-        // Many bindings expose decode(width, height, buffer) or decode(buffer, w, h)
-        let results = null;
-        try { results = nodeLibDmtx.decode(data, info.width, info.height); } catch (_) {
-          results = nodeLibDmtx.decode(info.width, info.height, data);
+        // Convert preprocessed PNG to raw RGBA for native bindings
+        const { data, info } = await sharp(preprocessed)
+          .ensureAlpha()
+          .raw()
+          .toBuffer({ resolveWithObject: true });
+
+        let dmtxResults = null;
+        try {
+          dmtxResults = nodeLibDmtx.decode(data, info.width, info.height);
+        } catch (_) {
+          dmtxResults = nodeLibDmtx.decode(info.width, info.height, data);
         }
-        // Expect results as array of { text, points }
-        return res.json({ ok: true, results });
-      } catch (e) {
-        console.warn('node libdmtx decode error', e);
+
+        if (dmtxResults && dmtxResults.length > 0) {
+          return res.json({
+            ok: true,
+            results: dmtxResults.map(r => ({
+              text: r.text ?? String(r),
+              format: 'DataMatrix',
+              points: r.points,
+            })),
+          });
+        }
+      } catch (dmtxErr) {
+        console.warn('[scan] libdmtx error:', dmtxErr.message ?? dmtxErr);
       }
     }
 
-    // No native binding present — return 501 with helpful message
-    return res.status(501).json({
-      ok: false,
-      error: 'No server-side libdmtx binding available. Install a Node libdmtx package or use client-side decoders.',
-      info: { width: info.width, height: info.height }
-    });
+    // ── Nothing decoded ───────────────────────────────────────────────────────
+    return res.json({ ok: true, results: [] });
   } catch (err) {
-    console.error('scan error', err);
-    res.status(500).json({ error: err.message });
+    console.error('[scan] Unexpected error:', err);
+    return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
