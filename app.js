@@ -51,16 +51,36 @@ function decodeWithZXing(imgData) {
 }
 
 // libdmtx (C library) wrapper — loader exposes window.LibDmtx.scanImageData(imgData)
-function decodeWithLibDmtx(imgData) {
-  if (typeof window.LibDmtx === 'undefined' || typeof window.LibDmtx.scanImageData !== 'function') return null;
+// Server-side scan: POST frame to server endpoint /api/scan
+async function decodeWithServer(imgData) {
   try {
-    // may return null or an array-like result similar to ZBar
-    return window.LibDmtx.scanImageData(imgData);
+    // convert ImageData to Blob (PNG) for upload
+    const off = document.createElement('canvas');
+    off.width = imgData.width;
+    off.height = imgData.height;
+    const octx = off.getContext('2d');
+    octx.putImageData(imgData, 0, 0);
+    const blob = await new Promise(resolve => off.toBlob(resolve, 'image/png'));
+    const fd = new FormData();
+    fd.append('image', blob, 'frame.png');
+
+    const resp = await fetch('/api/scan', { method: 'POST', body: fd });
+    if (!resp.ok) {
+      const j = await resp.json().catch(() => ({}));
+      console.warn('server scan failed', resp.status, j);
+      return null;
+    }
+    const j = await resp.json();
+    // Expect { ok: true, results: [ { text, points } ] }
+    return j.results || null;
   } catch (e) {
-    console.warn('libdmtx decode error', e);
+    console.warn('decodeWithServer error', e);
     return null;
   }
 }
+
+// Backwards-compatible alias used in places where libdmtx was previously tried
+function decodeWithLibDmtx(imgData) { return decodeWithServer(imgData); }
 
 // ─── OpenCV helpers (added for robust DataMatrix detection) ────────────────
 
