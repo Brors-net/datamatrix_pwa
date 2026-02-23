@@ -15,27 +15,43 @@ function ensureCvReady() {
   if (cvReady) return;
   if (typeof cv === 'undefined') return;
 
-  // Ensure core APIs are available (cv.Mat and cv.imread). Some builds expose a
-  // `cv` object before the WASM runtime is fully initialised — guard against that.
-  const hasMat = (typeof cv.Mat === 'function' || typeof cv.Mat === 'object');
-  const hasImread = (typeof cv.imread === 'function');
-  if (hasMat && hasImread) {
-    cvReady = true;
-    console.info('OpenCV: runtime ready');
-    return;
+  // Some OpenCV.js builds expose a `cv` object before the WASM runtime is
+  // fully initialised. A lightweight "smoke test" is the most reliable
+  // indicator: try to construct a small `cv.Mat` and delete it. If that
+  // succeeds, the runtime is ready.
+  try {
+    const t = new cv.Mat();
+    if (t && typeof t.delete === 'function') {
+      t.delete();
+      cvReady = true;
+      console.info('OpenCV: runtime ready (smoke test)');
+      return;
+    }
+  } catch (e) {
+    // Not ready yet — fall through to attach hooks
   }
 
-  // Attach to either `cv.onRuntimeInitialized` or global Module hook if available.
-  if (typeof cv.onRuntimeInitialized === 'function') {
-    const prev = cv.onRuntimeInitialized;
-    cv.onRuntimeInitialized = () => { try { prev(); } catch (e) {} ; cvReady = true; console.info('OpenCV: runtime initialised (onRuntimeInitialized)'); };
-    return;
-  }
-  if (typeof Module !== 'undefined' && typeof Module.onRuntimeInitialized === 'function') {
-    const prevM = Module.onRuntimeInitialized;
-    Module.onRuntimeInitialized = () => { try { prevM(); } catch (e) {} ; cvReady = true; console.info('OpenCV: runtime initialised (Module.onRuntimeInitialized)'); };
-    return;
-  }
+  // Attach robust onRuntimeInitialized hooks to `cv` and global `Module` (if
+  // available). Preserve any existing handlers.
+  const attachHook = (obj, name) => {
+    try {
+      const prev = obj[name];
+      obj[name] = function() {
+        try { if (typeof prev === 'function') prev(); } catch (e) {}
+        try {
+          const t2 = new cv.Mat();
+          if (t2 && typeof t2.delete === 'function') t2.delete();
+        } catch (_) {}
+        cvReady = true;
+        console.info('OpenCV: runtime initialised (' + name + ')');
+      };
+    } catch (e) {
+      // ignore
+    }
+  };
+
+  if (typeof cv !== 'undefined') attachHook(cv, 'onRuntimeInitialized');
+  if (typeof Module !== 'undefined') attachHook(Module, 'onRuntimeInitialized');
 }
 
 // ZXing pure-JS decoder wrapper (DataMatrix)
