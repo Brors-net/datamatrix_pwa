@@ -38,3 +38,12 @@ Thumbs.db
 
 # Temporary
 *.tmp
+
+# Local vendor bundles (removed from repo)
+vendor/
+
+# Optional local tools and caches
+zxing-loader.js
+
+# Keep local debug / build artifacts out
+*.local
