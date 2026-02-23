@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Brors.NET DataMatrix Scanner</title>
+<link rel="manifest" href="manifest.json">
+<script async src="https://docs.opencv.org/4.9.0/opencv.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/zbar-wasm@latest/dist/index.min.js"></script>
+<style>
+body { background:#111; color:white; text-align:center; font-family:sans-serif; }
+video { width:100%; max-width:600px; }
+#logo { max-width:250px; margin-top:10px; }
+#help { display:none; }
+button { padding:10px; margin:5px; }
+</style>
+</head>
+<body>
+
+<img id="logo" src="logo.png" alt="Brors.NET Logo">
+<h2>Industrial DataMatrix Scanner</h2>
+
+<video id="video" playsinline></video><br>
+<button onclick="toggleHelp()">Hilfe</button>
+<div id="result">Scan läuft...</div>
+
+<div id="help">
+<h3>Hilfe</h3>
+<p>Optimierter Open Source DataMatrix Scanner.</p>
+<p>Autor: <b>Joerg@brors.net</b></p>
+<img src="logo.png" width="200">
+</div>
+
+<canvas id="canvas" style="display:none;"></canvas>
+
+<script src="app.js"></script>
+<script>
+function toggleHelp() {
+    const h = document.getElementById("help");
+    h.style.display = h.style.display === "none" ? "block" : "none";
+}
+</script>
+
+</body>
+</html>
