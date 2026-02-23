@@ -8,7 +8,7 @@ let scanning = false;
 let lastCorners = null;
 // hidden processing canvas so OpenCV doesn't overwrite the visible overlay
 const procCanvas = document.createElement('canvas');
-const pctx = procCanvas.getContext('2d');
+const pctx = procCanvas.getContext('2d', { willReadFrequently: true });
 let cvReady = false;
 
 function ensureCvReady() {
@@ -52,7 +52,9 @@ async function processImageOnce(img) {
   // prepare overlay canvas
   canvas.width = procCanvas.width;
   canvas.height = procCanvas.height;
+  // draw the loaded image to the visible canvas so the user sees it
   ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.drawImage(procCanvas, 0, 0);
 
   const imgData = pctx.getImageData(0, 0, procCanvas.width, procCanvas.height);
 
@@ -121,6 +123,155 @@ async function processImageOnce(img) {
   }
 }
 
+// selection support (user-drag to select region)
+let isSelecting = false;
+let selection = null; // {x,y,w,h}
+let selectStart = null;
+let imageMode = false; // true when a static image is loaded and displayed on canvas
+
+
+// enable or disable pointer events on the overlay canvas
+function setCanvasInteractive(active) {
+  if (active) {
+    canvas.style.pointerEvents = 'auto';
+  } else {
+    canvas.style.pointerEvents = 'none';
+  }
+}
+
+// convert pointer event to canvas coordinates
+function getCanvasPoint(e) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  return {
+    x: Math.round((e.clientX - rect.left) * scaleX),
+    y: Math.round((e.clientY - rect.top) * scaleY)
+  };
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (canvas.style.pointerEvents !== 'auto') return;
+  isSelecting = true;
+  selectStart = getCanvasPoint(e);
+  selection = { x: selectStart.x, y: selectStart.y, w: 0, h: 0 };
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  if (!isSelecting) return;
+  const p = getCanvasPoint(e);
+  selection.x = Math.min(selectStart.x, p.x);
+  selection.y = Math.min(selectStart.y, p.y);
+  selection.w = Math.abs(p.x - selectStart.x);
+  selection.h = Math.abs(p.y - selectStart.y);
+});
+
+canvas.addEventListener('pointerup', async (e) => {
+  if (!isSelecting) return;
+  isSelecting = false;
+  // require a minimum size
+  if (!selection || selection.w < 8 || selection.h < 8) {
+    selection = null;
+    return;
+  }
+  // get image data from processing canvas for the selected area
+  const imgData = pctx.getImageData(selection.x, selection.y, selection.w, selection.h);
+  await processSelection(imgData, selection.x, selection.y);
+});
+
+function renderImageOverlay() {
+  if (!imageMode) return;
+  // redraw image
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.drawImage(procCanvas, 0, 0);
+
+  // draw selection if present
+  if (selection) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(0, 150, 136, 0.15)';
+    ctx.strokeStyle = '#009688';
+    ctx.lineWidth = 2;
+    ctx.fillRect(selection.x, selection.y, selection.w, selection.h);
+    ctx.strokeRect(selection.x, selection.y, selection.w, selection.h);
+    ctx.restore();
+  }
+
+  // draw detection corners
+  if (lastCorners) {
+    ctx.strokeStyle = '#FF5722';
+    ctx.lineWidth = Math.max(3, Math.round(canvas.width * 0.004));
+    ctx.beginPath();
+    ctx.moveTo(lastCorners[0].x, lastCorners[0].y);
+    for (let i = 1; i < lastCorners.length; i++) ctx.lineTo(lastCorners[i].x, lastCorners[i].y);
+    ctx.closePath();
+    ctx.stroke();
+  }
+
+  requestAnimationFrame(renderImageOverlay);
+}
+
+async function processSelection(imgData, offsetX = 0, offsetY = 0) {
+  // try zbar first
+  if (typeof ZBar !== 'undefined' && typeof ZBar.scanImageData === 'function') {
+    try {
+      const result = await ZBar.scanImageData(imgData);
+      const output = document.getElementById('result');
+      if (result?.length) {
+        output.textContent = 'Gefunden: ' + result[0].data;
+        if (result[0].location && result[0].location.length >= 4) {
+          // map returned points into canvas coordinates
+          lastCorners = result[0].location.map(pt => ({ x: pt.x + offsetX, y: pt.y + offsetY }));
+        }
+        return;
+      } else {
+        output.textContent = 'Keine Codes im Auswahlbereich gefunden';
+      }
+    } catch (e) {
+      console.error('ZBar Fehler', e);
+    }
+  }
+
+  // fallback OpenCV detection on the selection
+  if (cvReady) {
+    // draw selection to a temporary canvas to use cv.imread
+    const tmp = document.createElement('canvas');
+    tmp.width = imgData.width;
+    tmp.height = imgData.height;
+    const tctx = tmp.getContext('2d');
+    tctx.putImageData(imgData, 0, 0);
+    const src = cv.imread(tmp);
+    const gray = new cv.Mat();
+    const thresh = new cv.Mat();
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.threshold(gray, thresh, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+    cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    for (let i = 0; i < contours.size(); i++) {
+      const cnt = contours.get(i);
+      const approx = new cv.Mat();
+      cv.approxPolyDP(cnt, approx, 0.02 * cv.arcLength(cnt, true), true);
+      if (approx.rows === 4) {
+        lastCorners = [];
+        for (let j = 0; j < 4; j++) {
+          const pt = approx.intPtr(j);
+          lastCorners.push({ x: pt[0] + offsetX, y: pt[1] + offsetY });
+        }
+        approx.delete();
+        cnt.delete();
+        break;
+      }
+      approx.delete();
+      cnt.delete();
+    }
+    hierarchy.delete();
+    contours.delete();
+    src.delete();
+    gray.delete();
+    thresh.delete();
+  }
+}
 function handleFile(file) {
   if (!file) return;
   lastCorners = null;
@@ -132,7 +283,13 @@ function handleFile(file) {
     const img = new Image();
     currentFileURL = URL.createObjectURL(file);
     img.onload = async () => {
+      // hide the live video and show the canvas with the loaded image
+      video.style.display = 'none';
+      canvas.style.display = 'block';
+      setCanvasInteractive(true);
+      imageMode = true;
       await processImageOnce(img);
+      requestAnimationFrame(renderImageOverlay);
       URL.revokeObjectURL(currentFileURL);
       currentFileURL = null;
     };
@@ -141,6 +298,11 @@ function handleFile(file) {
     currentFileURL = URL.createObjectURL(file);
     video.src = currentFileURL;
     video.onloadedmetadata = async () => {
+      // show live video playback and disable selection by default
+      video.style.display = '';
+      canvas.style.display = 'block';
+      setCanvasInteractive(false);
+      imageMode = false;
       video.play();
       scanning = true;
       // requestFrame loop will handle processing frames
@@ -201,6 +363,17 @@ function processFrame() {
 
   // clear previous overlay drawings (we don't draw the video here)
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // if user is selecting, draw the selection rectangle
+  if (selection) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(0, 150, 136, 0.15)';
+    ctx.strokeStyle = '#009688';
+    ctx.lineWidth = 2;
+    ctx.fillRect(selection.x, selection.y, selection.w, selection.h);
+    ctx.strokeRect(selection.x, selection.y, selection.w, selection.h);
+    ctx.restore();
+  }
 
   // get image data from the processing canvas for zbar and/or OpenCV
   const imgData = pctx.getImageData(0, 0, procCanvas.width, procCanvas.height);
@@ -285,3 +458,12 @@ document.getElementById('help-toggle').addEventListener('click', () => {
 
 // automatisch starten
 startCamera();
+
+// if ZBar failed to load (browser tracking prevention), notify the user
+setTimeout(() => {
+  if (typeof ZBar === 'undefined') {
+    const out = document.getElementById('result');
+    if (out) out.textContent = out.textContent + ' (Hinweis: Decoder nicht geladen — Tracking/Blocker?)';
+    console.warn('ZBar (zbar-wasm) is not available. The CDN script may have been blocked by tracking prevention.');
+  }
+}, 1200);
