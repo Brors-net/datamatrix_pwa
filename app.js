@@ -50,6 +50,18 @@ function decodeWithZXing(imgData) {
   }
 }
 
+// libdmtx (C library) wrapper — loader exposes window.LibDmtx.scanImageData(imgData)
+function decodeWithLibDmtx(imgData) {
+  if (typeof window.LibDmtx === 'undefined' || typeof window.LibDmtx.scanImageData !== 'function') return null;
+  try {
+    // may return null or an array-like result similar to ZBar
+    return window.LibDmtx.scanImageData(imgData);
+  } catch (e) {
+    console.warn('libdmtx decode error', e);
+    return null;
+  }
+}
+
 // ─── OpenCV helpers (added for robust DataMatrix detection) ────────────────
 
 /**
@@ -283,11 +295,32 @@ async function processImageOnce(img) {
 
   // try ZXing (pure JS DataMatrix) as a fallback if ZBar didn't return corners
   if (!lastCorners) {
-    const zx = decodeWithZXing(imgData);
-    if (zx) {
+    // try libdmtx (if available) first, then ZXing
+    const ld = decodeWithLibDmtx(imgData);
+    if (ld && ld.then) {
+      try {
+        const res = await ld;
+        if (res?.length) {
+          const sym = res[0];
+          const output = document.getElementById('result');
+          output.textContent = 'Gefunden: ' + (decodeSymbolText(sym) || sym.typeName || 'DataMatrix');
+          const pts = extractCorners(sym);
+          if (pts && pts.length) lastCorners = pts;
+        }
+      } catch (e) { /* ignore */ }
+    } else if (ld && ld.length) {
+      const sym = ld[0];
       const output = document.getElementById('result');
-      output.textContent = 'Gefunden: ' + (zx.text || 'DataMatrix');
-      if (zx.points && zx.points.length) lastCorners = zx.points;
+      output.textContent = 'Gefunden: ' + (decodeSymbolText(sym) || sym.typeName || 'DataMatrix');
+      const pts = extractCorners(sym);
+      if (pts && pts.length) lastCorners = pts;
+    } else {
+      const zx = decodeWithZXing(imgData);
+      if (zx) {
+        const output = document.getElementById('result');
+        output.textContent = 'Gefunden: ' + (zx.text || 'DataMatrix');
+        if (zx.points && zx.points.length) lastCorners = zx.points;
+      }
     }
   }
 
@@ -449,6 +482,27 @@ async function processSelection(imgData, offsetX = 0, offsetY = 0) {
 
   // try ZXing DataMatrix decoder on the selection as a fallback
   if (!lastCorners) {
+    // try libdmtx first, then ZXing
+    const ld = decodeWithLibDmtx(imgData);
+    if (ld && ld.then) {
+      try {
+        const res = await ld;
+        if (res?.length) {
+          const output = document.getElementById('result');
+          output.textContent = 'Gefunden: ' + (decodeSymbolText(res[0]) || res[0].typeName || 'DataMatrix');
+          const pts = extractCorners(res[0]);
+          if (pts && pts.length) lastCorners = pts.map(p => ({ x: p.x + offsetX, y: p.y + offsetY }));
+          return;
+        }
+      } catch (e) { /* ignore */ }
+    } else if (ld && ld.length) {
+      const output = document.getElementById('result');
+      output.textContent = 'Gefunden: ' + (decodeSymbolText(ld[0]) || ld[0].typeName || 'DataMatrix');
+      const pts = extractCorners(ld[0]);
+      if (pts && pts.length) lastCorners = pts.map(p => ({ x: p.x + offsetX, y: p.y + offsetY }));
+      return;
+    }
+
     const zx = decodeWithZXing(imgData);
     if (zx) {
       const output = document.getElementById('result');
@@ -723,6 +777,18 @@ function processFrame() {
       } catch (e) { console.warn('ZBar(warped):', e); }
     }
 
+    // try libdmtx on warped patch (if available)
+    if (!decoded && warpedImgData && typeof window.LibDmtx !== 'undefined') {
+      try {
+        const res = await decodeWithLibDmtx(warpedImgData);
+        if (res?.length) {
+          foundText = decodeSymbolText(res[0]) || res[0].typeName || 'Gefunden';
+          foundPts  = warpedCorners;
+          decoded   = true;
+        }
+      } catch (e) { console.warn('libdmtx(warped):', e); }
+    }
+
     // ── 7b. ZBar on full preprocessed (binary→RGBA) frame
     if (!decoded &&
         typeof ZBar !== 'undefined' && typeof ZBar.scanImageData === 'function') {
@@ -736,6 +802,20 @@ function processFrame() {
           decoded   = true;
         }
       } catch (e) { console.warn('ZBar(full):', e); }
+    }
+
+    // try libdmtx on full preprocessed frame
+    if (!decoded && typeof window.LibDmtx !== 'undefined') {
+      try {
+        const res = await decodeWithLibDmtx(fullImgData);
+        if (res?.length) {
+          const sym = res[0];
+          foundText = decodeSymbolText(sym) || sym.typeName || 'Gefunden';
+          const pts = extractCorners(sym);
+          foundPts  = pts?.length ? pts : warpedCorners;
+          decoded   = true;
+        }
+      } catch (e) { console.warn('libdmtx(full):', e); }
     }
 
     // ── 7c. ZXing pure-JS DataMatrix fallback on raw frame
