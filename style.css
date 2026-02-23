@@ -53,8 +53,21 @@ video {
   background: #000;
 }
 
+/* the same canvas is used for processing and for drawing the result border
+   we position it on top of the video and make it transparent to pointer events */
 #canvas {
-  display: none;
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  /* keep visible so we can draw threshold/overlay; remove hiding */
+}
+
+/* ensure overlay follows the video's rounded corners */
+#canvas {
+  border-radius: 8px;
 }
 
 .controls {
@@ -83,6 +96,25 @@ button:hover {
 .result {
   margin-top: 0.5rem;
   font-weight: bold;
+}
+
+.control-row {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+  align-items: center;
+}
+
+input#file-input {
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+  background: var(--button-bg);
+  color: var(--text-color);
+  border: 1px solid rgba(255,255,255,0.06);
+}
+
+button#stop-button {
+  background: #9e9e9e;
 }
 
 .help {

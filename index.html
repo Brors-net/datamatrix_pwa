@@ -21,7 +21,11 @@
     <canvas id="canvas" aria-hidden="true"></canvas>
   </section>
   <section class="controls">
-    <button id="help-toggle" type="button">Hilfe</button>
+    <div class="control-row">
+      <button id="help-toggle" type="button">Hilfe</button>
+      <input id="file-input" type="file" accept="image/*,video/*" />
+      <button id="stop-button" type="button">Stopp</button>
+    </div>
     <div id="result" class="result">Scan läuft...</div>
   </section>
   <section id="help" class="help hidden">
