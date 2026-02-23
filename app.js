@@ -22,6 +22,34 @@ function ensureCvReady() {
   }
 }
 
+// ZXing pure-JS decoder wrapper (DataMatrix)
+function decodeWithZXing(imgData) {
+  if (typeof window.ZXingLib === 'undefined') return null;
+  try {
+    const ZX = window.ZXingLib;
+    const RGB = ZX.RGBLuminanceSource;
+    const Hybrid = ZX.HybridBinarizer;
+    const BinaryBitmap = ZX.BinaryBitmap;
+    const DataMatrixReader = ZX.DataMatrixReader;
+    if (!RGB || !Hybrid || !BinaryBitmap || !DataMatrixReader) return null;
+    const src = new RGB(imgData.data, imgData.width, imgData.height);
+    const bitmap = new BinaryBitmap(new Hybrid(src));
+    const reader = new DataMatrixReader();
+    const res = reader.decode(bitmap);
+    if (!res) return null;
+    const text = (typeof res.getText === 'function') ? res.getText() : (res.text || res.getResult ? res.getResult() : null);
+    let pts = null;
+    if (typeof res.getResultPoints === 'function') {
+      const rp = res.getResultPoints();
+      if (rp && rp.length) pts = Array.from(rp).map(p => ({ x: (p.getX ? p.getX() : p.x), y: (p.getY ? p.getY() : p.y) }));
+    }
+    return { text, points: pts, raw: res };
+  } catch (e) {
+    // decode throws when nothing found; ignore
+    return null;
+  }
+}
+
 function decodeSymbolText(sym) {
   try {
     if (!sym) return null;
@@ -108,6 +136,16 @@ async function processImageOnce(img) {
     }
   }
 
+  // try ZXing (pure JS DataMatrix) as a fallback if ZBar didn't return corners
+  if (!lastCorners) {
+    const zx = decodeWithZXing(imgData);
+    if (zx) {
+      const output = document.getElementById('result');
+      output.textContent = 'Gefunden: ' + (zx.text || 'DataMatrix');
+      if (zx.points && zx.points.length) lastCorners = zx.points;
+    }
+  }
+
   // fallback OpenCV contour detection
   if (cvReady && !lastCorners) {
     const src = cv.imread(procCanvas);
@@ -155,6 +193,7 @@ async function processImageOnce(img) {
   }
 }
 
+
 // selection support (user-drag to select region)
 let isSelecting = false;
 let selection = null; // {x,y,w,h}
@@ -192,8 +231,7 @@ canvas.addEventListener('pointerdown', (e) => {
 canvas.addEventListener('pointermove', (e) => {
   if (!isSelecting) return;
   const p = getCanvasPoint(e);
-  selection.x = Math.min(selectStart.x, p.x);
-  selection.y = Math.min(selectStart.y, p.y);
+  // update selection rectangle while dragging
   selection.w = Math.abs(p.x - selectStart.x);
   selection.h = Math.abs(p.y - selectStart.y);
 });
@@ -260,6 +298,17 @@ async function processSelection(imgData, offsetX = 0, offsetY = 0) {
       }
     } catch (e) {
       console.error('ZBar Fehler', e);
+    }
+  }
+
+  // try ZXing DataMatrix decoder on the selection as a fallback
+  if (!lastCorners) {
+    const zx = decodeWithZXing(imgData);
+    if (zx) {
+      const output = document.getElementById('result');
+      output.textContent = 'Gefunden: ' + (zx.text || 'DataMatrix');
+      if (zx.points && zx.points.length) lastCorners = zx.points.map(p => ({ x: p.x + offsetX, y: p.y + offsetY }));
+      return;
     }
   }
 
@@ -428,6 +477,16 @@ function processFrame() {
         }
       })
       .catch(err => console.error('Scan-Fehler', err));
+  }
+
+  // try ZXing synchronously as a fallback (DataMatrix)
+  if (!lastCorners) {
+    const zx = decodeWithZXing(imgData);
+    if (zx) {
+      const output = document.getElementById('result');
+      output.textContent = 'Gefunden: ' + (zx.text || 'DataMatrix');
+      if (zx.points && zx.points.length) lastCorners = zx.points;
+    }
   }
 
   // if OpenCV is ready, run preprocessing and contour fallback
