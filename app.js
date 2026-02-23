@@ -50,6 +50,142 @@ function decodeWithZXing(imgData) {
   }
 }
 
+// ─── OpenCV helpers (added for robust DataMatrix detection) ────────────────
+
+/**
+ * Sort 4 arbitrary corner points into [TL, TR, BR, BL] order.
+ * Uses coordinate sums / differences (robust for axis-aligned and rotated quads).
+ */
+function sortCorners(pts) {
+  // TL = min(x+y), BR = max(x+y)
+  const bySum = pts.slice().sort((a, b) => (a.x + a.y) - (b.x + b.y));
+  const tl = bySum[0];
+  const br = bySum[3];
+  // among the two middle points: TR has greater x, BL has lesser x
+  const mid = [bySum[1], bySum[2]].sort((a, b) => a.x - b.x);
+  const bl = mid[0];
+  const tr = mid[1];
+  return [tl, tr, br, bl];
+}
+
+/** Lazy CLAHE instance — created once after cv runtime is initialised. */
+let _clahe = null;
+function getCLAHE() {
+  if (_clahe) return _clahe;
+  try {
+    // OpenCV.js exposes CLAHE as a constructor class
+    _clahe = new cv.CLAHE(3.0, new cv.Size(8, 8));
+  } catch (_) {
+    try { _clahe = cv.createCLAHE(3.0, new cv.Size(8, 8)); } catch (_) { /* not available */ }
+  }
+  return _clahe;
+}
+
+/**
+ * Full preprocessing pipeline for small industrial DataMatrix codes.
+ * Input : RGBA cv.Mat (from cv.imread / procCanvas).
+ * Output: single-channel binary cv.Mat — caller MUST .delete() it.
+ * Pipeline: grayscale → CLAHE → GaussianBlur(3×3) → Otsu → Morph-Close(3×3)
+ */
+function opencvPreprocess(src) {
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+  // CLAHE: improves local contrast so faint module transitions become visible
+  const enhanced = new cv.Mat();
+  const clahe = getCLAHE();
+  if (clahe) {
+    clahe.apply(gray, enhanced);
+  } else {
+    gray.copyTo(enhanced); // graceful degradation
+  }
+  gray.delete();
+
+  // GaussianBlur: suppress noise before thresholding
+  const blurred = new cv.Mat();
+  cv.GaussianBlur(enhanced, blurred, new cv.Size(3, 3), 0);
+  enhanced.delete();
+
+  // Otsu threshold: auto-binarise
+  const binary = new cv.Mat();
+  cv.threshold(blurred, binary, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+  blurred.delete();
+
+  // Morphological closing: fill tiny holes/gaps in DataMatrix modules
+  const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+  const closed = new cv.Mat();
+  cv.morphologyEx(binary, closed, cv.MORPH_CLOSE, kernel);
+  kernel.delete();
+  binary.delete();
+
+  return closed; // single-channel binary
+}
+
+/**
+ * Warp a detected quadrilateral to a 400×400 RGBA square.
+ * corners = [TL, TR, BR, BL] from sortCorners().
+ * Returns warped RGBA cv.Mat — caller MUST .delete() it.
+ */
+function warpToSquare(srcMat, corners, size = 400) {
+  const [tl, tr, br, bl] = corners;
+  const srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
+    tl.x, tl.y,
+    tr.x, tr.y,
+    br.x, br.y,
+    bl.x, bl.y,
+  ]);
+  const dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
+    0,    0,
+    size, 0,
+    size, size,
+    0,    size,
+  ]);
+  const M = cv.getPerspectiveTransform(srcPts, dstPts);
+  const warped = new cv.Mat();
+  cv.warpPerspective(srcMat, warped, M, new cv.Size(size, size));
+  srcPts.delete(); dstPts.delete(); M.delete();
+  return warped; // RGBA, size × size
+}
+
+/**
+ * Zero-copy conversion from an RGBA cv.Mat to an ImageData object.
+ * No extra canvas round-trip needed.
+ */
+function matToImageData(rgbaMat) {
+  return new ImageData(
+    new Uint8ClampedArray(rgbaMat.data.buffer, rgbaMat.data.byteOffset, rgbaMat.data.byteLength),
+    rgbaMat.cols,
+    rgbaMat.rows
+  );
+}
+
+/**
+ * Draw a closed polygon border on the overlay canvas.
+ * @param {Array<{x,y}>} corners
+ * @param {string} color  CSS colour string
+ */
+function drawDetectionBorder(corners, color = '#FF5722') {
+  if (!corners || corners.length < 2) return;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = Math.max(3, Math.round(canvas.width * 0.004));
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(corners[0].x, corners[0].y);
+  for (let i = 1; i < corners.length; i++) ctx.lineTo(corners[i].x, corners[i].y);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
+/**
+ * Throttle flag: prevents queuing multiple concurrent ZBar async calls
+ * when OpenCV processing finishes faster than ZBar resolves.
+ */
+let _frameScanning = false;
+
+// ─── End OpenCV helpers ──────────────────────────────────────────────────────
+
 function decodeSymbolText(sym) {
   try {
     if (!sym) return null;
@@ -425,121 +561,185 @@ function stopCamera() {
   scanning = false;
 }
 
+/**
+ * processFrame — refactored for robust small-DataMatrix detection.
+ *
+ * Architecture:
+ *   • Synchronous: capture frame → OpenCV preprocess → contour quad detection
+ *     → perspective warp to 400×400.
+ *   • Async (fire-and-forget, guarded by _frameScanning flag):
+ *       1) ZBar on warped patch
+ *       2) ZBar on preprocessed full frame
+ *       3) ZXing fallback on raw frame
+ *   • Overlay drawn from lastCorners which persists until next successful scan
+ *     (or cleared when a complete scan cycle finds nothing).
+ */
 function processFrame() {
   if (!scanning || video.readyState !== 4) {
     return requestAnimationFrame(processFrame);
   }
-
-  // make sure OpenCV runtime is ready (if it's loaded async)
   ensureCvReady();
 
-  // set processing canvas size to video dimensions
-  procCanvas.width = video.videoWidth;
+  // ── 1. Capture frame into procCanvas ────────────────────────────────────
+  procCanvas.width  = video.videoWidth;
   procCanvas.height = video.videoHeight;
+  canvas.width  = procCanvas.width;
+  canvas.height = procCanvas.height;
   pctx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
 
-  // visible overlay canvas matches processing size (CSS scales separately)
-  canvas.width = procCanvas.width;
-  canvas.height = procCanvas.height;
-
-  // clear previous overlay drawings (we don't draw the video here)
+  // ── 2. Paint overlay (selection + last known border) ────────────────────
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-  // if user is selecting, draw the selection rectangle
   if (selection) {
     ctx.save();
-    ctx.fillStyle = 'rgba(0, 150, 136, 0.15)';
+    ctx.fillStyle   = 'rgba(0, 150, 136, 0.15)';
     ctx.strokeStyle = '#009688';
-    ctx.lineWidth = 2;
+    ctx.lineWidth   = 2;
     ctx.fillRect(selection.x, selection.y, selection.w, selection.h);
     ctx.strokeRect(selection.x, selection.y, selection.w, selection.h);
     ctx.restore();
   }
+  // Draw persistent border from last completed scan cycle
+  if (lastCorners) drawDetectionBorder(lastCorners, '#FF5722');
 
-  // get image data from the processing canvas for zbar and/or OpenCV
-  const imgData = pctx.getImageData(0, 0, procCanvas.width, procCanvas.height);
-
-  // scan with ZBar if available
-  if (typeof ZBar !== 'undefined' && typeof ZBar.scanImageData === 'function') {
-    ZBar.scanImageData(imgData)
-      .then(result => {
-        const output = document.getElementById('result');
-        if (result?.length) {
-          const sym = result[0];
-          const text = decodeSymbolText(sym) || sym.typeName || 'Gefunden';
-          output.textContent = 'Gefunden: ' + text;
-          const pts = extractCorners(sym);
-          if (pts && pts.length) {
-            lastCorners = pts;
-          }
-        } else {
-          output.textContent = 'Scan läuft...';
-        }
-      })
-      .catch(err => console.error('Scan-Fehler', err));
+  // ── 3. Skip new scan if previous async decode still running ─────────────
+  if (_frameScanning) {
+    return requestAnimationFrame(processFrame);
   }
 
-  // try ZXing synchronously as a fallback (DataMatrix)
-  if (!lastCorners) {
-    const zx = decodeWithZXing(imgData);
+  // ── 4. Synchronous OpenCV preprocessing ─────────────────────────────────
+  if (!cvReady) {
+    // CV not ready yet — ZXing-only lightweight pass
+    const raw = pctx.getImageData(0, 0, procCanvas.width, procCanvas.height);
+    const zx  = decodeWithZXing(raw);
     if (zx) {
-      const output = document.getElementById('result');
-      output.textContent = 'Gefunden: ' + (zx.text || 'DataMatrix');
-      if (zx.points && zx.points.length) lastCorners = zx.points;
+      document.getElementById('result').textContent = 'Gefunden: ' + (zx.text || 'DataMatrix');
+      lastCorners = zx.points?.length ? zx.points : lastCorners;
     }
+    return requestAnimationFrame(processFrame);
   }
 
-  // if OpenCV is ready, run preprocessing and contour fallback
-  if (cvReady) {
-    const src = cv.imread(procCanvas);
-    const gray = new cv.Mat();
-    const thresh = new cv.Mat();
+  // Read RGBA frame into OpenCV Mat
+  const src    = cv.imread(procCanvas);
+  // Full preprocessing pipeline: CLAHE → GaussianBlur → Otsu → Morph-Close
+  const binary = opencvPreprocess(src);
 
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-    cv.threshold(gray, thresh, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+  // ── 5. Contour detection on binary image ────────────────────────────────
+  const contours  = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+  // Use RETR_EXTERNAL to focus on outer boundaries of the DataMatrix
+  cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-    if (!lastCorners) {
-      const contours = new cv.MatVector();
-      const hierarchy = new cv.Mat();
-      cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-      for (let i = 0; i < contours.size(); i++) {
-        const cnt = contours.get(i);
-        const approx = new cv.Mat();
-        cv.approxPolyDP(cnt, approx, 0.02 * cv.arcLength(cnt, true), true);
-        if (approx.rows === 4) {
-          lastCorners = [];
-          for (let j = 0; j < 4; j++) {
-            const pt = approx.intPtr(j);
-            lastCorners.push({ x: pt[0], y: pt[1] });
-          }
-          approx.delete();
-          cnt.delete();
-          break;
+  let warpedCorners = null; // sorted [TL, TR, BR, BL] if a quad is found
+  let warpedMat     = null; // perspective-corrected patch (RGBA)
+
+  // Find the largest 4-point approximation (most likely the DataMatrix border)
+  let bestArea = 0;
+  for (let i = 0; i < contours.size(); i++) {
+    const cnt  = contours.get(i);
+    const area = cv.contourArea(cnt);
+    if (area < 200) { cnt.delete(); continue; } // skip tiny blobs
+
+    const approx = new cv.Mat();
+    // epsilon ~4% of arc length gives stable quads for ECC200
+    cv.approxPolyDP(cnt, approx, 0.04 * cv.arcLength(cnt, true), true);
+
+    if (approx.rows === 4 && area > bestArea) {
+      bestArea = area;
+      const d = approx.data32S; // CV_32SC2 → Int32Array, stride = 2
+      const raw = [
+        { x: d[0], y: d[1] },
+        { x: d[2], y: d[3] },
+        { x: d[4], y: d[5] },
+        { x: d[6], y: d[7] },
+      ];
+      warpedCorners = sortCorners(raw); // TL, TR, BR, BL
+    }
+    approx.delete();
+    cnt.delete();
+  }
+  contours.delete();
+  hierarchy.delete();
+
+  // ── 6. Perspective warp of detected quad ────────────────────────────────
+  if (warpedCorners) {
+    warpedMat = warpToSquare(src, warpedCorners, 400);
+    // Show detected quad immediately (cyan) while async decode is in flight
+    drawDetectionBorder(warpedCorners, '#00BCD4');
+  }
+
+  // Snapshot full binary frame as ImageData for ZBar fallback
+  // Convert single-channel binary → RGBA so ZBar can consume it
+  const binaryRGBA = new cv.Mat();
+  cv.cvtColor(binary, binaryRGBA, cv.COLOR_GRAY2RGBA);
+  const fullImgData = matToImageData(binaryRGBA);
+  binaryRGBA.delete();
+  binary.delete();
+
+  // Raw RGBA ImageData for ZXing (keeps original colour information)
+  const rawImgData = pctx.getImageData(0, 0, procCanvas.width, procCanvas.height);
+
+  // Pre-compute warped ImageData (sync, before we delete warpedMat)
+  const warpedImgData = warpedMat ? matToImageData(warpedMat) : null;
+  // warpedMat can be deleted now — ImageData holds its own buffer copy
+  if (warpedMat) { warpedMat.delete(); warpedMat = null; }
+  src.delete();
+
+  // ── 7. Async decode pipeline (fire-and-forget) ───────────────────────────
+  _frameScanning = true;
+  (async () => {
+    const output  = document.getElementById('result');
+    let decoded   = false;
+    let foundText = '';
+    let foundPts  = null;
+
+    // ── 7a. ZBar on perspective-warped patch (best quality for small codes)
+    if (!decoded && warpedImgData &&
+        typeof ZBar !== 'undefined' && typeof ZBar.scanImageData === 'function') {
+      try {
+        const res = await ZBar.scanImageData(warpedImgData);
+        if (res?.length) {
+          foundText = decodeSymbolText(res[0]) || res[0].typeName || 'Gefunden';
+          // corners come from OCV, not from ZBar (warped coord space)
+          foundPts  = warpedCorners;
+          decoded   = true;
         }
-        approx.delete();
-        cnt.delete();
+      } catch (e) { console.warn('ZBar(warped):', e); }
+    }
+
+    // ── 7b. ZBar on full preprocessed (binary→RGBA) frame
+    if (!decoded &&
+        typeof ZBar !== 'undefined' && typeof ZBar.scanImageData === 'function') {
+      try {
+        const res = await ZBar.scanImageData(fullImgData);
+        if (res?.length) {
+          const sym = res[0];
+          foundText = decodeSymbolText(sym) || sym.typeName || 'Gefunden';
+          const pts = extractCorners(sym);
+          foundPts  = pts?.length ? pts : warpedCorners;
+          decoded   = true;
+        }
+      } catch (e) { console.warn('ZBar(full):', e); }
+    }
+
+    // ── 7c. ZXing pure-JS DataMatrix fallback on raw frame
+    if (!decoded) {
+      const zx = decodeWithZXing(rawImgData);
+      if (zx) {
+        foundText = zx.text || 'DataMatrix';
+        foundPts  = zx.points?.length ? zx.points : warpedCorners;
+        decoded   = true;
       }
-      hierarchy.delete();
-      contours.delete();
     }
 
-    src.delete();
-    gray.delete();
-    thresh.delete();
-  }
-
-  // draw a border if we have corner data (either from ZBar or our own fallback)
-  if (lastCorners) {
-    ctx.strokeStyle = '#FF5722';
-    ctx.lineWidth = 4;
-    ctx.beginPath();
-    ctx.moveTo(lastCorners[0].x, lastCorners[0].y);
-    for (let i = 1; i < lastCorners.length; i++) {
-      ctx.lineTo(lastCorners[i].x, lastCorners[i].y);
+    // ── 7d. Update UI & state
+    if (decoded) {
+      output.textContent = 'Gefunden: ' + foundText;
+      lastCorners = foundPts;                      // persist for next frame overlay
+    } else {
+      output.textContent = 'Scan läuft...';
+      lastCorners = null;                          // clear stale border
     }
-    ctx.closePath();
-    ctx.stroke();
-  }
+  })().finally(() => { _frameScanning = false; });
 
   requestAnimationFrame(processFrame);
 }
