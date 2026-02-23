@@ -13,12 +13,28 @@ let cvReady = false;
 
 function ensureCvReady() {
   if (cvReady) return;
-  if (typeof cv !== 'undefined' && typeof cv.imread === 'function') {
+  if (typeof cv === 'undefined') return;
+
+  // Ensure core APIs are available (cv.Mat and cv.imread). Some builds expose a
+  // `cv` object before the WASM runtime is fully initialised — guard against that.
+  const hasMat = (typeof cv.Mat === 'function' || typeof cv.Mat === 'object');
+  const hasImread = (typeof cv.imread === 'function');
+  if (hasMat && hasImread) {
     cvReady = true;
+    console.info('OpenCV: runtime ready');
     return;
   }
-  if (typeof cv !== 'undefined' && typeof cv.onRuntimeInitialized === 'function') {
-    cv.onRuntimeInitialized = () => { cvReady = true; };
+
+  // Attach to either `cv.onRuntimeInitialized` or global Module hook if available.
+  if (typeof cv.onRuntimeInitialized === 'function') {
+    const prev = cv.onRuntimeInitialized;
+    cv.onRuntimeInitialized = () => { try { prev(); } catch (e) {} ; cvReady = true; console.info('OpenCV: runtime initialised (onRuntimeInitialized)'); };
+    return;
+  }
+  if (typeof Module !== 'undefined' && typeof Module.onRuntimeInitialized === 'function') {
+    const prevM = Module.onRuntimeInitialized;
+    Module.onRuntimeInitialized = () => { try { prevM(); } catch (e) {} ; cvReady = true; console.info('OpenCV: runtime initialised (Module.onRuntimeInitialized)'); };
+    return;
   }
 }
 
