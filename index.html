@@ -3,43 +3,39 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Brors.NET DataMatrix Scanner</title>
+<title>Industrial DataMatrix Scanner</title>
+<link rel="stylesheet" href="style.css">
 <link rel="manifest" href="manifest.json">
 <script async src="https://docs.opencv.org/4.9.0/opencv.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/zbar-wasm@latest/dist/index.min.js"></script>
-<style>
-body { background:#111; color:white; text-align:center; font-family:sans-serif; }
-video { width:100%; max-width:600px; }
-#logo { max-width:250px; margin-top:10px; }
-#help { display:none; }
-button { padding:10px; margin:5px; }
-</style>
 </head>
 <body>
+<header class="app-header">
+  <img id="logo" src="logo.png" alt="Brors.NET Logo">
+  <h1>Industrial DataMatrix Scanner</h1>
+</header>
 
-<img id="logo" src="logo.png" alt="Brors.NET Logo">
-<h2>Industrial DataMatrix Scanner</h2>
+<main class="app-content">
+  <section class="video-container">
+    <video id="video" playsinline></video>
+    <canvas id="canvas" aria-hidden="true"></canvas>
+  </section>
+  <section class="controls">
+    <button id="help-toggle" type="button">Hilfe</button>
+    <div id="result" class="result">Scan läuft...</div>
+  </section>
+  <section id="help" class="help hidden">
+    <h2>Hilfe</h2>
+    <p>Optimierter Open Source DataMatrix Scanner.</p>
+    <p>Autor: <b>Joerg@brors.net</b></p>
+    <img src="logo.png" width="200" alt="Brors.NET Logo">
+  </section>
+</main>
 
-<video id="video" playsinline></video><br>
-<button onclick="toggleHelp()">Hilfe</button>
-<div id="result">Scan läuft...</div>
-
-<div id="help">
-<h3>Hilfe</h3>
-<p>Optimierter Open Source DataMatrix Scanner.</p>
-<p>Autor: <b>Joerg@brors.net</b></p>
-<img src="logo.png" width="200">
-</div>
-
-<canvas id="canvas" style="display:none;"></canvas>
+<footer class="app-footer">
+  &copy; 2026 Brors.NET – alle Rechte vorbehalten.
+</footer>
 
 <script src="app.js"></script>
-<script>
-function toggleHelp() {
-    const h = document.getElementById("help");
-    h.style.display = h.style.display === "none" ? "block" : "none";
-}
-</script>
-
 </body>
 </html>
