@@ -7,7 +7,39 @@
 <link rel="stylesheet" href="style.css">
 <link rel="manifest" href="manifest.json">
 <script async src="https://docs.opencv.org/4.9.0/opencv.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/zbar-wasm@latest/dist/index.min.js"></script>
+<!-- prefer local zbar-wasm; if not present we try the CDN as fallback -->
+<script src="vendor/zbar-wasm/index.min.js"></script>
+<script>
+  // try to map common export names from the bundled script to `ZBar`
+  (function mapZBarGlobal(){
+    const map = () => {
+      if (typeof ZBar !== 'undefined') return true;
+      // common UMD/global names used by builds
+      const candidates = [window.zbarWasm, window.zbar_wasm, window.zbar, window.ZBar, window.zbarWasmModule, window.zbarWasm?.default];
+      for (const c of candidates) {
+        if (typeof c !== 'undefined') {
+          window.ZBar = c;
+          console.log('ZBar mapped from available global');
+          return true;
+        }
+      }
+      return false;
+    };
+
+    if (!map()) {
+      // fallback: try CDN for @undecaf package (known working build)
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/@undecaf/zbar-wasm@0.11.0/dist/index.js';
+      s.onload = () => {
+        // attempt mapping again after load
+        if (!map()) console.warn('zbar-wasm loaded but global mapping failed');
+        else console.log('zbar-wasm loaded from CDN fallback');
+      };
+      s.onerror = () => console.warn('zbar-wasm not found locally and CDN failed. Place zbar files in vendor/zbar-wasm/');
+      document.head.appendChild(s);
+    }
+  })();
+</script>
 </head>
 <body>
 <header class="app-header">

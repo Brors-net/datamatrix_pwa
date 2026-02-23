@@ -21,6 +21,37 @@ function ensureCvReady() {
     cv.onRuntimeInitialized = () => { cvReady = true; };
   }
 }
+
+function decodeSymbolText(sym) {
+  try {
+    if (!sym) return null;
+    if (typeof sym.decode === 'function') {
+      return sym.decode();
+    }
+    if (sym.data) {
+      if (sym.data instanceof Uint8Array) return new TextDecoder().decode(sym.data);
+      return String(sym.data);
+    }
+    if (sym.rawData) {
+      if (sym.rawData instanceof Uint8Array) return new TextDecoder().decode(sym.rawData);
+      return String(sym.rawData);
+    }
+    if (sym.dataString) return String(sym.dataString);
+    if (sym.raw) return String(sym.raw);
+  } catch (e) {
+    console.warn('Could not decode symbol text', e);
+  }
+  return null;
+}
+
+function extractCorners(sym) {
+  if (!sym) return null;
+  // common property names
+  if (Array.isArray(sym.points) && sym.points.length) return sym.points.map(p => ({ x: p.x, y: p.y }));
+  if (Array.isArray(sym.location) && sym.location.length) return sym.location.map(p => ({ x: p.x ?? p[0], y: p.y ?? p[1] }));
+  if (Array.isArray(sym.corners) && sym.corners.length) return sym.corners.map(p => ({ x: p.x, y: p.y }));
+  return null;
+}
 // file/media handling
 const fileInput = document.getElementById('file-input');
 const stopButton = document.getElementById('stop-button');
@@ -64,10 +95,11 @@ async function processImageOnce(img) {
       const result = await ZBar.scanImageData(imgData);
       const output = document.getElementById('result');
       if (result?.length) {
-        output.textContent = 'Gefunden: ' + result[0].data;
-        if (result[0].location && result[0].location.length >= 4) {
-          lastCorners = result[0].location;
-        }
+        const sym = result[0];
+        const text = decodeSymbolText(sym) || sym.typeName || 'Gefunden';
+        output.textContent = 'Gefunden: ' + text;
+        const pts = extractCorners(sym);
+        if (pts && pts.length) lastCorners = pts;
       } else {
         output.textContent = 'Keine Codes gefunden';
       }
@@ -384,11 +416,12 @@ function processFrame() {
       .then(result => {
         const output = document.getElementById('result');
         if (result?.length) {
-          output.textContent = 'Gefunden: ' + result[0].data;
-          if (result[0].location && result[0].location.length >= 4) {
-            lastCorners = result[0].location;
-          } else {
-            // keep previous corners — OpenCV fallback may update below
+          const sym = result[0];
+          const text = decodeSymbolText(sym) || sym.typeName || 'Gefunden';
+          output.textContent = 'Gefunden: ' + text;
+          const pts = extractCorners(sym);
+          if (pts && pts.length) {
+            lastCorners = pts;
           }
         } else {
           output.textContent = 'Scan läuft...';
