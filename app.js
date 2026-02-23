@@ -73,25 +73,25 @@ let _clahe = null;
 function getCLAHE() {
   if (_clahe) return _clahe;
   try {
-    // OpenCV.js exposes CLAHE as a constructor class
-    _clahe = new cv.CLAHE(3.0, new cv.Size(8, 8));
+    // clipLimit 2.0, tileSize 4×4 — better for small ECC 200 module grids
+    _clahe = new cv.CLAHE(2.0, new cv.Size(4, 4));
   } catch (_) {
-    try { _clahe = cv.createCLAHE(3.0, new cv.Size(8, 8)); } catch (_) { /* not available */ }
+    try { _clahe = cv.createCLAHE(2.0, new cv.Size(4, 4)); } catch (_) { /* not available */ }
   }
   return _clahe;
 }
 
 /**
- * Full preprocessing pipeline for small industrial DataMatrix codes.
+ * Full preprocessing pipeline optimised for ECC 200 DataMatrix codes.
  * Input : RGBA cv.Mat (from cv.imread / procCanvas).
  * Output: single-channel binary cv.Mat — caller MUST .delete() it.
- * Pipeline: grayscale → CLAHE → GaussianBlur(3×3) → Otsu → Morph-Close(3×3)
+ * Pipeline: grayscale → CLAHE(2.0,4×4) → UnsharpMask → AdaptiveThreshold(21) → Morph-Close(3×3)
  */
 function opencvPreprocess(src) {
   const gray = new cv.Mat();
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
-  // CLAHE: improves local contrast so faint module transitions become visible
+  // CLAHE: boosts local contrast on small module grids
   const enhanced = new cv.Mat();
   const clahe = getCLAHE();
   if (clahe) {
@@ -101,17 +101,23 @@ function opencvPreprocess(src) {
   }
   gray.delete();
 
-  // GaussianBlur: suppress noise before thresholding
-  const blurred = new cv.Mat();
-  cv.GaussianBlur(enhanced, blurred, new cv.Size(3, 3), 0);
+  // Unsharp mask: sharpen ECC 200 module edges before thresholding
+  // result = 1.5 * src - 0.5 * blur(src, sigma=3)
+  const blurTemp = new cv.Mat();
+  cv.GaussianBlur(enhanced, blurTemp, new cv.Size(0, 0), 3);
+  const sharpened = new cv.Mat();
+  cv.addWeighted(enhanced, 1.5, blurTemp, -0.5, 0, sharpened);
+  blurTemp.delete();
   enhanced.delete();
 
-  // Otsu threshold: auto-binarise
+  // Adaptive threshold: robust to non-uniform illumination across the frame.
+  // blockSize=21 covers module sizes of 3–15 px (typical camera distances).
   const binary = new cv.Mat();
-  cv.threshold(blurred, binary, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-  blurred.delete();
+  cv.adaptiveThreshold(sharpened, binary, 255,
+    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 21, 4);
+  sharpened.delete();
 
-  // Morphological closing: fill tiny holes/gaps in DataMatrix modules
+  // Morphological closing: fill tiny holes/gaps in ECC 200 modules
   const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
   const closed = new cv.Mat();
   cv.morphologyEx(binary, closed, cv.MORPH_CLOSE, kernel);
@@ -148,15 +154,18 @@ function warpToSquare(srcMat, corners, size = 400) {
 }
 
 /**
- * Zero-copy conversion from an RGBA cv.Mat to an ImageData object.
- * No extra canvas round-trip needed.
+ * Convert an RGBA cv.Mat to an ImageData object.
+ *
+ * NOTE: We must copy the pixel bytes into a fresh Uint8ClampedArray whose
+ * .buffer owns exactly width×height×4 bytes.  Passing a shared-buffer view
+ * (new Uint8ClampedArray(wasm.memory.buffer, offset, len)) causes ImageData
+ * to validate against the full 128 MB WebAssembly heap and throw
+ * "data length does not match width and height".
  */
 function matToImageData(rgbaMat) {
-  return new ImageData(
-    new Uint8ClampedArray(rgbaMat.data.buffer, rgbaMat.data.byteOffset, rgbaMat.data.byteLength),
-    rgbaMat.cols,
-    rgbaMat.rows
-  );
+  // new Uint8ClampedArray(typedArray) copies elements into a new, self-owned buffer
+  const pixels = new Uint8ClampedArray(rgbaMat.data);
+  return new ImageData(pixels, rgbaMat.cols, rgbaMat.rows);
 }
 
 /**
@@ -282,39 +291,40 @@ async function processImageOnce(img) {
     }
   }
 
-  // fallback OpenCV contour detection
+  // fallback OpenCV contour detection — uses full ECC 200 preprocessing pipeline
   if (cvReady && !lastCorners) {
     const src = cv.imread(procCanvas);
-    const gray = new cv.Mat();
-    const thresh = new cv.Mat();
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-    cv.threshold(gray, thresh, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-
+    const binary = opencvPreprocess(src);
     const contours = new cv.MatVector();
     const hierarchy = new cv.Mat();
-    cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    let bestArea = 0;
     for (let i = 0; i < contours.size(); i++) {
       const cnt = contours.get(i);
+      const area = cv.contourArea(cnt);
+      if (area < 200) { cnt.delete(); continue; }
       const approx = new cv.Mat();
-      cv.approxPolyDP(cnt, approx, 0.02 * cv.arcLength(cnt, true), true);
-      if (approx.rows === 4) {
-        lastCorners = [];
-        for (let j = 0; j < 4; j++) {
-          const pt = approx.intPtr(j);
-          lastCorners.push({ x: pt[0], y: pt[1] });
+      cv.approxPolyDP(cnt, approx, 0.04 * cv.arcLength(cnt, true), true);
+      if (approx.rows === 4 && area > bestArea && cv.isContourConvex(approx)) {
+        const rect = cv.boundingRect(approx);
+        const ratio = rect.width / Math.max(rect.height, 1);
+        if (ratio >= 0.35 && ratio <= 3.0) {
+          bestArea = area;
+          const d = approx.data32S;
+          lastCorners = [
+            { x: d[0], y: d[1] }, { x: d[2], y: d[3] },
+            { x: d[4], y: d[5] }, { x: d[6], y: d[7] },
+          ];
         }
-        approx.delete();
-        cnt.delete();
-        break;
       }
       approx.delete();
       cnt.delete();
     }
+    if (lastCorners) lastCorners = sortCorners(lastCorners);
     hierarchy.delete();
     contours.delete();
+    binary.delete();
     src.delete();
-    gray.delete();
-    thresh.delete();
   }
 
   // draw border if corners available
@@ -448,45 +458,46 @@ async function processSelection(imgData, offsetX = 0, offsetY = 0) {
     }
   }
 
-  // fallback OpenCV detection on the selection
+  // fallback OpenCV detection on the selection — uses full ECC 200 pipeline
   if (cvReady) {
-    // draw selection to a temporary canvas to use cv.imread
     const tmp = document.createElement('canvas');
     tmp.width = imgData.width;
     tmp.height = imgData.height;
     const tctx = tmp.getContext('2d');
     tctx.putImageData(imgData, 0, 0);
     const src = cv.imread(tmp);
-    const gray = new cv.Mat();
-    const thresh = new cv.Mat();
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-    cv.threshold(gray, thresh, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-
+    const binary = opencvPreprocess(src);
     const contours = new cv.MatVector();
     const hierarchy = new cv.Mat();
-    cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    let bestArea = 0;
     for (let i = 0; i < contours.size(); i++) {
       const cnt = contours.get(i);
+      const area = cv.contourArea(cnt);
+      if (area < 200) { cnt.delete(); continue; }
       const approx = new cv.Mat();
-      cv.approxPolyDP(cnt, approx, 0.02 * cv.arcLength(cnt, true), true);
-      if (approx.rows === 4) {
-        lastCorners = [];
-        for (let j = 0; j < 4; j++) {
-          const pt = approx.intPtr(j);
-          lastCorners.push({ x: pt[0] + offsetX, y: pt[1] + offsetY });
+      cv.approxPolyDP(cnt, approx, 0.04 * cv.arcLength(cnt, true), true);
+      if (approx.rows === 4 && area > bestArea && cv.isContourConvex(approx)) {
+        const rect = cv.boundingRect(approx);
+        const ratio = rect.width / Math.max(rect.height, 1);
+        if (ratio >= 0.35 && ratio <= 3.0) {
+          bestArea = area;
+          const d = approx.data32S;
+          lastCorners = sortCorners([
+            { x: d[0] + offsetX, y: d[1] + offsetY },
+            { x: d[2] + offsetX, y: d[3] + offsetY },
+            { x: d[4] + offsetX, y: d[5] + offsetY },
+            { x: d[6] + offsetX, y: d[7] + offsetY },
+          ]);
         }
-        approx.delete();
-        cnt.delete();
-        break;
       }
       approx.delete();
       cnt.delete();
     }
     hierarchy.delete();
     contours.delete();
+    binary.delete();
     src.delete();
-    gray.delete();
-    thresh.delete();
   }
 }
 function handleFile(file) {
@@ -620,7 +631,7 @@ function processFrame() {
 
   // Read RGBA frame into OpenCV Mat
   const src    = cv.imread(procCanvas);
-  // Full preprocessing pipeline: CLAHE → GaussianBlur → Otsu → Morph-Close
+  // Full ECC 200 pipeline: CLAHE(2.0,4×4) → UnsharpMask → AdaptiveThresh(21) → Morph-Close
   const binary = opencvPreprocess(src);
 
   // ── 5. Contour detection on binary image ────────────────────────────────
@@ -644,6 +655,12 @@ function processFrame() {
     cv.approxPolyDP(cnt, approx, 0.04 * cv.arcLength(cnt, true), true);
 
     if (approx.rows === 4 && area > bestArea) {
+      // ECC 200: outer boundary must be convex
+      if (!cv.isContourConvex(approx)) { approx.delete(); cnt.delete(); continue; }
+      // ECC 200 aspect ratio: square variants ≈1.0; rectangular 1:2 / 1:3 allowed
+      const rect = cv.boundingRect(approx);
+      const ratio = rect.width / Math.max(rect.height, 1);
+      if (ratio < 0.35 || ratio > 3.0) { approx.delete(); cnt.delete(); continue; }
       bestArea = area;
       const d = approx.data32S; // CV_32SC2 → Int32Array, stride = 2
       const raw = [
